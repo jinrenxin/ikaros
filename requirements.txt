@@ -6,6 +6,7 @@ lxml
 beautifulsoup4
 MechanicalSoup
 cloudscraper
+requests
 transmission_rpc
-scrapinglib
+scrapinglib==0.12.2
 flask-sock

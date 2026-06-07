@@ -4,6 +4,8 @@
 import os
 import re
 import shutil
+import requests
+from io import BytesIO
 from PIL import Image
 from lxml import etree
 from flask import current_app
@@ -12,7 +14,8 @@ from ..service.taskservice import taskService
 from ..service.configservice import scrapingConfService, localConfService, _ScrapingConfigs
 from ..utils.filehelper import linkFile, moveSubsbyFilepath
 from ..utils.number_parser import FileNumInfo
-from scrapinglib import search, httprequest
+from scrapinglib import search
+from scrapinglib.scraper import Scraping
 
 
 def escapePath(path, escape_literals: str):
@@ -95,31 +98,112 @@ def parseJsonInfo(json_data):
     return title, studio, year, outline, runtime, director, actor_photo, release, number, cover, trailer, website, series, label
 
 
-def download_file_with_filename(url, filename, path):
+def remove_file_silent(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        current_app.logger.debug(f"[-]Remove file failed: {path}, {e}")
+
+
+def is_valid_image_bytes(content):
+    if not content:
+        return False
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
+def is_valid_image_file(path):
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception as e:
+        current_app.logger.info(f"[-]Invalid image file: {path}, {e}")
+        return False
+
+
+def image_log_context(source=None, image_kind=None):
+    parts = []
+    if source:
+        parts.append(f"source={source}")
+    if image_kind:
+        parts.append(f"image={image_kind}")
+    return " ".join(parts)
+
+
+def log_bad_image(message, url, filename, source=None, image_kind=None, err=None):
+    context = image_log_context(source, image_kind)
+    current_app.logger.error(f"[-]{message} {context} file={filename} url={url}")
+    if err:
+        current_app.logger.error(err)
+
+
+def parse_cookie_string(raw_cookie):
+    if not raw_cookie or not isinstance(raw_cookie, str):
+        return None
+    cookies = {}
+    for item in raw_cookie.split(';'):
+        item = item.strip()
+        if not item or '=' not in item:
+            continue
+        key, value = item.split('=', 1)
+        key = key.strip()
+        if key:
+            cookies[key] = value.strip()
+    return cookies or None
+
+
+def download_file_with_filename(url, filename, path, source=None, image_kind=None):
     """ 下载文件
     """
     configProxy = localConfService.getProxyConfig()
     proxies = configProxy.proxies() if configProxy.enable else None
+    filepath = os.path.join(path, filename)
+    if not url:
+        log_bad_image("download source empty!", url, filename, source, image_kind)
+        remove_file_silent(filepath)
+        return False
     if not os.path.exists(path):
         os.makedirs(path)
     try:
-        r = httprequest.get(url, proxies=proxies, return_type='object')
-        if r == '':
-            current_app.logger.error(f"[-] download source not found! {url}")
+        r = requests.get(url, proxies=proxies, timeout=10)
+        if not r:
+            log_bad_image("download source not found!", url, filename, source, image_kind)
+            remove_file_silent(filepath)
             return False
-        with open(os.path.join(path, filename), "wb") as code:
-            code.write(r.content)
+        if hasattr(r, 'ok') and not r.ok:
+            log_bad_image(f"download failed status {r.status_code}!", url, filename, source, image_kind)
+            remove_file_silent(filepath)
+            return False
+        content = getattr(r, 'content', None)
+        if not is_valid_image_bytes(content):
+            log_bad_image("download invalid image!", url, filename, source, image_kind)
+            remove_file_silent(filepath)
+            return False
+        with open(filepath, "wb") as code:
+            code.write(content)
+        if not is_valid_image_file(filepath):
+            remove_file_silent(filepath)
+            return False
         return True
-    except:
-        current_app.logger.error(f"[-] download failed! {url}")
+    except Exception as e:
+        remove_file_silent(filepath)
+        log_bad_image("download failed!", url, filename, source, image_kind, e)
         return False
 
 
-def download_poster(path, prefilename, cover_small_url):
+def download_poster(path, prefilename, cover_small_url, source=None):
     """ Download Poster
     """
     postername = prefilename + '-poster.jpg'
-    if download_file_with_filename(cover_small_url, postername, path):
+    if download_file_with_filename(cover_small_url, postername, path, source, 'poster'):
         current_app.logger.debug('[+]Poster Downloaded! ' + postername)
         return True
     else:
@@ -127,15 +211,18 @@ def download_poster(path, prefilename, cover_small_url):
         return False
 
 
-def download_cover(cover_url, prefilename, path):
+def download_cover(cover_url, prefilename, path, source=None):
     """ Download Cover
     """
     fanartname = prefilename + '-fanart.jpg'
     fanartpath = os.path.join(path, fanartname)
     thumbpath = os.path.join(path, prefilename + '-thumb.jpg')
-    if download_file_with_filename(cover_url, fanartname, path):
+    if download_file_with_filename(cover_url, fanartname, path, source, 'fanart'):
         current_app.logger.debug('[+]Cover Downloaded! ' + fanartname)
         shutil.copyfile(fanartpath, thumbpath)
+        if not is_valid_image_file(thumbpath):
+            remove_file_silent(thumbpath)
+            return False
         return True
     else:
         current_app.logger.info('[+]Download Cover Failed! ' + fanartname)
@@ -270,19 +357,28 @@ def crop_poster(imagecut, path, prefilename):
     fanartpath = os.path.join(path, prefilename + '-fanart.jpg')
     posterpath = os.path.join(path, prefilename + '-poster.jpg')
     try:
+        if imagecut == 3:
+            return is_valid_image_file(posterpath)
         if imagecut == 1:
-            img = Image.open(fanartpath)
-            w = img.width
-            h = img.height
-            img2 = img.crop((w / 1.9, 0, w, h))
-            img2.save(posterpath)
+            with Image.open(fanartpath) as img:
+                w = img.width
+                h = img.height
+                img2 = img.crop((w / 1.9, 0, w, h))
+                img2.save(posterpath)
             current_app.logger.debug('[+]Image Cutted!     ' + posterpath)
         elif imagecut != 3:
             # 复制封面
             shutil.copyfile(fanartpath, posterpath)
             current_app.logger.debug('[+]Image Copyed!     ' + posterpath)
-    except:
+        if imagecut != 3 and not is_valid_image_file(posterpath):
+            remove_file_silent(posterpath)
+            return False
+        return True
+    except Exception as e:
+        remove_file_silent(posterpath)
         current_app.logger.info('[-]Cover cut failed!')
+        current_app.logger.info(e)
+        return False
 
 
 def add_mark(pics, numinfo: FileNumInfo, count, size):
@@ -304,24 +400,30 @@ def add_mark(pics, numinfo: FileNumInfo, count, size):
     if mark_type == '':
         return
     for pic in pics:
-        add_mark_thread(pic, numinfo, count, size)
-        current_app.logger.debug('[+]Image Add Mark:   ' + mark_type.strip(','))
+        try:
+            if not is_valid_image_file(pic):
+                current_app.logger.info(f"[-]Skip watermark invalid image: {pic}")
+                continue
+            add_mark_thread(pic, numinfo, count, size)
+            current_app.logger.debug('[+]Image Add Mark:   ' + mark_type.strip(','))
+        except Exception as e:
+            current_app.logger.info(f"[-]Watermark failed: {pic}")
+            current_app.logger.info(e)
 
 
 def add_mark_thread(pic_path, numinfo: FileNumInfo, count, size):
-    img_pic = Image.open(pic_path)
-    if numinfo.chs_tag:
-        add_to_pic(pic_path, img_pic, size, count, 1)
-        count = (count + 1) % 4
-    if numinfo.leak_tag:
-        add_to_pic(pic_path, img_pic, size, count, 2)
-        count = (count + 1) % 4
-    if numinfo.uncensored_tag:
-        add_to_pic(pic_path, img_pic, size, count, 3)
-        count = (count + 1) % 4
-    if numinfo.hack_tag:
-        add_to_pic(pic_path, img_pic, size, count, 4)
-    img_pic.close()
+    with Image.open(pic_path) as img_pic:
+        if numinfo.chs_tag:
+            add_to_pic(pic_path, img_pic, size, count, 1)
+            count = (count + 1) % 4
+        if numinfo.leak_tag:
+            add_to_pic(pic_path, img_pic, size, count, 2)
+            count = (count + 1) % 4
+        if numinfo.uncensored_tag:
+            add_to_pic(pic_path, img_pic, size, count, 3)
+            count = (count + 1) % 4
+        if numinfo.hack_tag:
+            add_to_pic(pic_path, img_pic, size, count, 4)
 
 
 def add_to_pic(pic_path, img_pic, size, count, mode):
@@ -386,7 +488,69 @@ def paste_file_to_folder(filepath, path, prefilename, link_type, extra=False):
         return False, ''
 
 
-def core_main(filepath, numinfo: FileNumInfo, conf: _ScrapingConfigs, specifiedsource=None, specifiedurl=None):
+def get_scraping_sources(c_sources, number, specifiedsource=None):
+    if specifiedsource:
+        return [specifiedsource]
+    if not c_sources:
+        c_sources = "javlibrary,javdb,javbus,airav,fanza,xcity,jav321,mgstage,fc2,avsox,dlsite,carib,madouclub,madouqu,getchu,gcolle"
+    return Scraping().checkAdultSources(c_sources, number)
+
+
+def cleanup_scraping_assets(path, prefilename, remove_folder=False):
+    for suffix in ['-poster.jpg', '-fanart.jpg', '-thumb.jpg', '.nfo']:
+        remove_file_silent(os.path.join(path, prefilename + suffix))
+    if remove_folder:
+        try:
+            if os.path.isdir(path) and not os.listdir(path):
+                os.rmdir(path)
+        except Exception as e:
+            current_app.logger.debug(f"[-]Clean folder failed: {path}, {e}")
+
+
+def prepare_core_images(path, prefilename, json_data, source=None):
+    imagecut = json_data.get('imagecut')
+    cover_url = json_data.get('cover')
+    poster_url = json_data.get('cover_small')
+    if imagecut == 3:
+        if not download_poster(path, prefilename, poster_url, source):
+            return False
+        if not is_valid_image_file(os.path.join(path, prefilename + '-poster.jpg')):
+            log_bad_image("poster invalid after download!", poster_url, prefilename + '-poster.jpg', source, 'poster')
+            return False
+    if not download_cover(cover_url, prefilename, path, source):
+        return False
+    if not is_valid_image_file(os.path.join(path, prefilename + '-fanart.jpg')):
+        log_bad_image("fanart invalid after download!", cover_url, prefilename + '-fanart.jpg', source, 'fanart')
+        return False
+    if not is_valid_image_file(os.path.join(path, prefilename + '-thumb.jpg')):
+        log_bad_image("thumb invalid after copy!", cover_url, prefilename + '-thumb.jpg', source, 'thumb')
+        return False
+    if not crop_poster(imagecut, path, prefilename):
+        log_bad_image("poster crop failed!", cover_url, prefilename + '-poster.jpg', source, 'poster')
+        return False
+    if not is_valid_image_file(os.path.join(path, prefilename + '-poster.jpg')):
+        log_bad_image("poster invalid after crop!", cover_url, prefilename + '-poster.jpg', source, 'poster')
+        return False
+    return True
+
+
+def finish_scraping_assets(path, prefilename, json_data, numinfo, conf):
+    if numinfo.isPartOneOrSingle():
+        try:
+            if conf.extrafanart_enable and json_data.get('extrafanart'):
+                download_extrafanart(json_data.get('extrafanart'), path, conf.extrafanart_folder)
+        except Exception as e:
+            current_app.logger.info('[-]Download Extrafanart Failed!')
+            current_app.logger.info(e)
+
+    if conf.watermark_enable:
+        pics = [os.path.join(path, prefilename + '-poster.jpg'),
+                os.path.join(path, prefilename + '-thumb.jpg')]
+        add_mark(pics, numinfo, conf.watermark_location, conf.watermark_size)
+    return create_nfo_file(path, prefilename, json_data, numinfo)
+
+
+def core_main_legacy(filepath, numinfo: FileNumInfo, conf: _ScrapingConfigs, specifiedsource=None, specifiedurl=None):
     """ 开始刮削
     :param filepath     文件路径
     :param numinfo      番号信息
@@ -491,6 +655,71 @@ def core_main(filepath, numinfo: FileNumInfo, conf: _ScrapingConfigs, specifieds
 
         return True, filepath
     return False, ''
+
+
+def core_main(filepath, numinfo: FileNumInfo, conf: _ScrapingConfigs, specifiedsource=None, specifiedurl=None):
+    configProxy = localConfService.getProxyConfig()
+    proxies = configProxy.proxies() if configProxy.enable else None
+    sources = get_scraping_sources(conf.site_sources, numinfo.num, specifiedsource)
+    javdb_cookies = parse_cookie_string(getattr(conf, 'cookies_javdb', ''))
+
+    for source in sources:
+        current_app.logger.info(f"[+]Try scraping source: {source}")
+        try:
+            json_data = search(numinfo.num, source,
+                               specifiedSource=source,
+                               specifiedUrl=specifiedurl if specifiedsource else None,
+                               proxies=proxies,
+                               dbcookies=javdb_cookies,
+                               morestoryline=conf.morestoryline)
+        except Exception as e:
+            current_app.logger.info(f"[-]Search source failed: {source}")
+            current_app.logger.info(e)
+            continue
+
+        if json_data is None:
+            current_app.logger.info(f"[-]Empty Info from source: {source}")
+            continue
+        if json_data.get('number') == '' and numinfo.num:
+            json_data['number'] = numinfo.num
+        if not json_data or json_data.get('title') == '':
+            current_app.logger.info(f"[-]Movie Data not found from source: {source}")
+            continue
+
+        json_data = fixJson(json_data, conf.naming_rule)
+        if conf.main_mode == 1:
+            path = createFolder(json_data, conf, numinfo.special)
+            prefilename = numinfo.fixedName()
+        elif conf.main_mode == 2:
+            path = createFolder(json_data, conf, numinfo.special)
+            prefilename = numinfo.fixedName()
+        elif conf.main_mode == 3:
+            path = os.path.dirname(filepath)
+            name = os.path.basename(filepath)
+            prefilename = os.path.splitext(name)[0]
+        else:
+            return False, ''
+
+        should_prepare_assets = conf.main_mode == 3 or (conf.main_mode == 1 and not numinfo.special)
+        if should_prepare_assets:
+            if not prepare_core_images(path, prefilename, json_data, source):
+                current_app.logger.info(f"[-]Core image invalid from source: {source}")
+                cleanup_scraping_assets(path, prefilename, conf.main_mode == 1)
+                continue
+            if not finish_scraping_assets(path, prefilename, json_data, numinfo, conf):
+                cleanup_scraping_assets(path, prefilename, conf.main_mode == 1)
+                continue
+
+        if conf.main_mode == 3:
+            return True, filepath
+
+        flag, newpath = paste_file_to_folder(filepath, path, prefilename, conf.link_type)
+        if flag:
+            return flag, newpath
+        return flag, newpath
+
+    current_app.logger.error('[-]All sources failed: metadata or core images unavailable.')
+    return False, moveFailedFolder(filepath)
 
 
 def fixJson(json_data, c_naming_rule):

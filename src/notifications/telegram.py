@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from scrapinglib import httprequest
+import requests
 from flask import current_app
 from ..service.configservice import localConfService
 
@@ -26,7 +26,7 @@ class Telegram():
             configProxy = localConfService.getProxyConfig()
             proxies = configProxy.proxies() if configProxy.enable else None
             try:
-                httprequest.get(url, proxies=proxies)
+                requests.get(url, proxies=proxies, timeout=10)
             except Exception as ex:
                 current_app.logger.debug(ex)
                 pass
@@ -40,7 +40,7 @@ class Telegram():
             configProxy = localConfService.getProxyConfig()
             proxies = configProxy.proxies() if configProxy.enable else None
             try:
-                httprequest.post(url, params, proxies=proxies)
+                requests.post(url, data=params, proxies=proxies, timeout=10)
             except Exception as ex:
                 current_app.logger.debug(ex)
                 pass
@@ -56,7 +56,7 @@ class Telegram():
                 configProxy = localConfService.getProxyConfig()
                 proxies = configProxy.proxies() if configProxy.enable else None
                 try:
-                    httprequest.post(url, params, files=files, proxies=proxies)
+                    requests.post(url, data=params, files=files, proxies=proxies, timeout=10)
                 except Exception as ex:
                     current_app.logger.debug(ex)
                     pass         

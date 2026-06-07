@@ -180,6 +180,11 @@ def startScrapingAll(cid, folder=''):
     taskService.updateTaskNum(task, total)
     current_app.logger.info("[*]======================================================")
     current_app.logger.info('[+]Find  ' + str(total) + '  movies')
+    if total == 0:
+        taskService.updateTaskStatus(task, 1)
+        current_app.logger.info("[+] All scraping finished!!!")
+        current_app.logger.info("[*]======================================================")
+        return 1
 
     threadPoolSize = conf.threads_num
     currentThreads = []
@@ -228,6 +233,7 @@ def startScrapingSingle(cid, movie_path: str, forced=False):
     # taskService.updateTaskStatus(task, 2)
     task.status = 2
     task.cid = cid
+    taskService.updateTaskNum(task, 1)
     taskService.commit()
 
     conf = scrapingConfService.getConfig(cid)
@@ -248,6 +254,7 @@ def startScrapingSingle(cid, movie_path: str, forced=False):
     if os.path.exists(movie_path) and os.path.isfile(movie_path):
         currentApp = current_app._get_current_object()
         create_data_and_move(movie_path, conf, currentApp, forced)
+        taskService.updateTaskFinished(task, 1)
     else:
         scrapingrecordService.updateDeleted(movie_info)
 

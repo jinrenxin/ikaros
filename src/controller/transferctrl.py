@@ -102,7 +102,7 @@ def getTransRecord():
     taskinfo = taskService.getTask('transfer')
     if taskinfo.status == 2:
         ret['running'] = True
-        ret['tasktotal'] = taskinfo.total
+        ret['tasktotal'] = taskinfo.total if taskinfo.total else 1
         ret['taskfinished'] = taskinfo.finished
     else:
         ret['running'] = False
